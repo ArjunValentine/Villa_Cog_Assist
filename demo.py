@@ -49,11 +49,27 @@ def main():
                     # Print feature availability
                     gaze_status = "✓" if frame_data.gaze else "✗"
                     posture_status = "✓" if frame_data.posture else "✗"
-                    print(f"  Gaze: {gaze_status} | Posture: {posture_status}")
+                    objects_count = len(frame_data.detected_objects)
+                    intersections_count = len(frame_data.gaze_intersections)
+
+                    print(f"  Gaze: {gaze_status} | Posture: {posture_status} | Objects: {objects_count} | Intersections: {intersections_count}")
 
                     if frame_data.posture:
                         print(".2f"
                               ".2f")
+
+                    # Print detected objects
+                    if frame_data.detected_objects:
+                        print("  Detected objects:")
+                        for obj in frame_data.detected_objects[:3]:  # Show first 3
+                            print(".2f"
+                                  ".2f")
+
+                    # Print gaze intersections
+                    if frame_data.gaze_intersections:
+                        print("  Gaze intersections:")
+                        for intersection in frame_data.gaze_intersections[:2]:  # Show first 2
+                            print(".2f")
 
             # Small delay to prevent overwhelming output
             time.sleep(0.1)

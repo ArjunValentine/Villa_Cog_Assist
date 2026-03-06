@@ -1,0 +1,2 @@
+[console_scripts]
+villa-cog-assist = demo:main
