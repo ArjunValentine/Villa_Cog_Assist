@@ -2,13 +2,18 @@
 """
 Layered Audio Processing Pipeline — Ontological Resonance Matrix
 
-Three-tier progressive audio feature extraction:
-  Tier 1 (Core):     FFT consonance, spectral features, energy VAD — always active
-  Tier 2 (Enhanced): MFCCs, chroma, onset, tempo, pitch — when CPU allows
-  Tier 3 (Canary):   Audio classification, prosody, anomaly detection — on schedule or anomaly
+Three-tier progressive audio feature extraction with edge filtering:
+  Tier 1 (Core):       FFT consonance, spectral features, Silero VAD — always active
+  Tier 2 (Enhanced):   MFCCs, chroma, onset, tempo, pitch — when CPU allows
+  Tier 3 (Canary):     Behavioral audio analysis, prosody, anomaly detection
+  Edge Filter:         YAMNet classification + Whisper.cpp STT — speech→text at the edge
+
+Lean Workflow:
+  1. Sensory Intake → 2. Edge Filtering (VAD/YAMNet/Whisper) → 3. Local DB Query →
+  4. Traffic Cop Triage (Phi-3 mini) → 5. Escalate to Claude only when needed
 
 Design principle: Extract → Vectorize → Score → Discard
-Raw audio samples are NEVER stored. Only compact feature vectors persist.
+Raw audio samples are NEVER stored. Only compact feature vectors + transcribed text persist.
 
 Author: Peter J Villa / ArjunValentine
 License: MIT
@@ -26,23 +31,47 @@ from typing import Optional, List, Dict, Tuple
 # Tier 1: always available
 import pyaudio
 
-# Tier 2: optional (graceful degradation)
+# Tier 2: optional — enhanced spectral features
 try:
     import librosa
     LIBROSA_AVAILABLE = True
 except ImportError:
     LIBROSA_AVAILABLE = False
 
-# Tier 3: optional (graceful degradation)
+# Edge Filter: Silero VAD (PyTorch or ONNX)
+SILERO_AVAILABLE = False
+try:
+    import torch
+    SILERO_AVAILABLE = True
+except ImportError:
+    try:
+        import onnxruntime
+        SILERO_AVAILABLE = True  # will use ONNX path
+    except ImportError:
+        pass
+
+# Edge Filter: YAMNet audio classification (TFLite)
+YAMNET_AVAILABLE = False
 try:
     import tensorflow as tf
-    TFLITE_AVAILABLE = True
+    YAMNET_AVAILABLE = True
 except ImportError:
     try:
         import tflite_runtime.interpreter as tflite
-        TFLITE_AVAILABLE = True
+        YAMNET_AVAILABLE = True
     except ImportError:
-        TFLITE_AVAILABLE = False
+        pass
+
+# Keep legacy alias
+TFLITE_AVAILABLE = YAMNET_AVAILABLE
+
+# Edge Filter: Whisper STT (local speech-to-text)
+WHISPER_AVAILABLE = False
+try:
+    from faster_whisper import WhisperModel
+    WHISPER_AVAILABLE = True
+except ImportError:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +96,7 @@ class AudioFeatureVector:
     rms_energy: float = 0.0              # normalized loudness
     zero_crossing_rate: float = 0.0      # rate — texture indicator
     vad_state: bool = False              # voice activity detected
+    vad_confidence: float = 0.0          # Silero VAD speech probability
     peak_frequencies: List[float] = field(default_factory=list)
 
     # --- Tier 2: Enhanced (when librosa available) ---
@@ -77,9 +107,13 @@ class AudioFeatureVector:
     pitch_mean: float = 0.0                     # Hz fundamental frequency
     pitch_variance: float = 0.0                 # Hz² — voice stability indicator
 
-    # --- Tier 3: Canary (ML models) ---
-    audio_event: str = ""                       # classified audio event
+    # --- Edge Filter: Classification + STT ---
+    audio_event: str = ""                       # YAMNet or heuristic event class
     event_confidence: float = 0.0               # classification confidence
+    transcribed_text: str = ""                  # Whisper.cpp STT output (speech only)
+    yamnet_top3: List[str] = field(default_factory=list)  # top 3 YAMNet classes
+
+    # --- Tier 3: Canary (behavioral analysis) ---
     prosody_valence: float = 0.5                # 0=distressed, 1=positive
     speech_rate: float = 0.0                    # estimated syllables/sec
     repetition_score: float = 0.0               # 0=novel, 1=highly repetitive
@@ -359,7 +393,276 @@ class Tier2Enhanced:
 
 
 # ---------------------------------------------------------------------------
-# Tier 3: Canary — ML classification + anomaly detection
+# Edge Filter: Silero VAD — replaces heuristic voice activity detection
+# ---------------------------------------------------------------------------
+
+class SileroVAD:
+    """
+    Silero Voice Activity Detection.
+
+    Replaces the energy-based heuristic VAD with a trained neural model.
+    ~1MB model, processes 512-sample chunks (32ms at 16kHz).
+    Much more accurate at distinguishing speech from ambient noise.
+
+    Supports PyTorch (preferred) or ONNX runtime (lighter).
+    """
+
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self.model = None
+        self._use_onnx = False
+        self._state = None  # model hidden state (for streaming)
+        self._load_model()
+
+    def _load_model(self):
+        """Load Silero VAD model (PyTorch or ONNX)."""
+        try:
+            import torch
+            self.model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                trust_repo=True,
+            )
+            self.model.eval()
+            self._torch = torch
+            print("[SileroVAD] Loaded PyTorch model")
+        except Exception as e:
+            print(f"[SileroVAD] PyTorch load failed ({e}), trying ONNX...")
+            try:
+                import onnxruntime
+                # Expect silero_vad.onnx in working directory or models/
+                import os
+                for path in ['silero_vad.onnx', 'models/silero_vad.onnx']:
+                    if os.path.exists(path):
+                        self.model = onnxruntime.InferenceSession(path)
+                        self._use_onnx = True
+                        print(f"[SileroVAD] Loaded ONNX model from {path}")
+                        return
+                print("[SileroVAD] ONNX model file not found")
+            except Exception as e2:
+                print(f"[SileroVAD] ONNX load also failed: {e2}")
+
+    def detect(self, samples: np.ndarray) -> Tuple[bool, float]:
+        """
+        Detect voice activity in audio samples.
+
+        Args:
+            samples: Audio samples (float32, 16kHz)
+
+        Returns:
+            (is_speech, confidence) where confidence is 0.0–1.0
+        """
+        if self.model is None:
+            return False, 0.0
+
+        try:
+            if self._use_onnx:
+                return self._detect_onnx(samples)
+            else:
+                return self._detect_torch(samples)
+        except Exception as e:
+            print(f"[SileroVAD] Detection error: {e}")
+            return False, 0.0
+
+    def _detect_torch(self, samples: np.ndarray) -> Tuple[bool, float]:
+        """PyTorch inference path."""
+        audio = self._torch.FloatTensor(samples)
+        # Process in 512-sample chunks, take max probability
+        chunk_size = 512
+        max_prob = 0.0
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i:i + chunk_size]
+            if len(chunk) < chunk_size:
+                chunk = self._torch.nn.functional.pad(chunk, (0, chunk_size - len(chunk)))
+            prob = self.model(chunk, self.sample_rate).item()
+            max_prob = max(max_prob, prob)
+        return max_prob > 0.5, float(max_prob)
+
+    def _detect_onnx(self, samples: np.ndarray) -> Tuple[bool, float]:
+        """ONNX runtime inference path."""
+        # Simplified: feed full window, model handles internally
+        audio = samples.astype(np.float32).reshape(1, -1)
+        if self._state is None:
+            # Initialize hidden state for ONNX model
+            self._state = np.zeros((2, 1, 64), dtype=np.float32)
+        ort_inputs = {
+            'input': audio,
+            'state': self._state,
+            'sr': np.array([self.sample_rate], dtype=np.int64),
+        }
+        try:
+            output, state_out = self.model.run(None, ort_inputs)
+            self._state = state_out
+            prob = float(output[0])
+            return prob > 0.5, prob
+        except Exception:
+            # Fallback: simple energy check
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            return rms > 0.01, rms
+
+    def reset(self):
+        """Reset model state (call between sessions)."""
+        self._state = None
+        if self.model and not self._use_onnx:
+            self.model.reset_states()
+
+
+# ---------------------------------------------------------------------------
+# Edge Filter: YAMNet — 521-class audio event classification
+# ---------------------------------------------------------------------------
+
+class YAMNetClassifier:
+    """
+    YAMNet audio event classification via TFLite.
+
+    521 audio event categories: speech, music, dog bark, glass breaking,
+    coughing, siren, footsteps, etc. Processes 0.975s windows at 16kHz.
+
+    Critical for the canary function: detects falls, distress sounds,
+    glass breaking, and other environmental safety events.
+    """
+
+    # Top canary-relevant YAMNet classes
+    SAFETY_EVENTS = {
+        'Glass', 'Shatter', 'Crash', 'Thud', 'Bang',
+        'Screaming', 'Crying', 'Whimper', 'Groan', 'Moan',
+        'Fall', 'Thump', 'Slam',
+        'Fire alarm', 'Smoke detector', 'Siren', 'Alarm',
+        'Cough', 'Choking', 'Gasp',
+    }
+
+    def __init__(self, model_path: str = 'yamnet.tflite', class_map_path: str = 'yamnet_class_map.csv'):
+        self.interpreter = None
+        self.class_names = []
+        self._load_model(model_path, class_map_path)
+
+    def _load_model(self, model_path: str, class_map_path: str):
+        """Load YAMNet TFLite model and class map."""
+        import os
+
+        # Load class names
+        if os.path.exists(class_map_path):
+            with open(class_map_path, 'r') as f:
+                # CSV format: index, mid, display_name
+                lines = f.readlines()[1:]  # skip header
+                self.class_names = [line.strip().split(',')[-1].strip('"') for line in lines]
+
+        # Load TFLite model
+        if os.path.exists(model_path):
+            try:
+                try:
+                    import tensorflow as tf
+                    self.interpreter = tf.lite.Interpreter(model_path=model_path)
+                except ImportError:
+                    import tflite_runtime.interpreter as tflite_rt
+                    self.interpreter = tflite_rt.Interpreter(model_path=model_path)
+
+                self.interpreter.allocate_tensors()
+                self._input_details = self.interpreter.get_input_details()
+                self._output_details = self.interpreter.get_output_details()
+                print(f"[YAMNet] Loaded model with {len(self.class_names)} classes")
+            except Exception as e:
+                print(f"[YAMNet] Failed to load model: {e}")
+        else:
+            print(f"[YAMNet] Model not found at {model_path} — using heuristic fallback")
+
+    def classify(self, samples: np.ndarray, sample_rate: int = 16000) -> Tuple[str, float, List[str]]:
+        """
+        Classify audio event.
+
+        Returns:
+            (top_class, confidence, top3_classes)
+        """
+        if self.interpreter is None or not self.class_names:
+            return "", 0.0, []
+
+        try:
+            # YAMNet expects float32 waveform at 16kHz
+            audio = samples.astype(np.float32)
+
+            # Set input tensor
+            self.interpreter.set_tensor(self._input_details[0]['index'], audio)
+            self.interpreter.invoke()
+
+            # Get output scores
+            scores = self.interpreter.get_tensor(self._output_details[0]['index'])
+            mean_scores = np.mean(scores, axis=0)  # average across time frames
+
+            # Top 3
+            top_indices = np.argsort(mean_scores)[-3:][::-1]
+            top_class = self.class_names[top_indices[0]] if top_indices[0] < len(self.class_names) else ""
+            confidence = float(mean_scores[top_indices[0]])
+            top3 = [self.class_names[i] for i in top_indices if i < len(self.class_names)]
+
+            return top_class, confidence, top3
+
+        except Exception as e:
+            print(f"[YAMNet] Classification error: {e}")
+            return "", 0.0, []
+
+    def is_safety_event(self, event_class: str) -> bool:
+        """Check if the classified event is safety-relevant for canary."""
+        return any(s.lower() in event_class.lower() for s in self.SAFETY_EVENTS)
+
+
+# ---------------------------------------------------------------------------
+# Edge Filter: Whisper STT — local speech-to-text (never sends audio to cloud)
+# ---------------------------------------------------------------------------
+
+class WhisperSTT:
+    """
+    Local speech-to-text via faster-whisper (CTranslate2 backend).
+
+    Converts speech segments to text ON THE EDGE DEVICE.
+    Raw audio never leaves the local machine — only transcribed text
+    gets stored in the database or sent to the traffic cop.
+
+    Model sizes:
+      tiny  (~39MB, fastest, good enough for triage keywords)
+      base  (~74MB, better accuracy)
+      small (~244MB, good accuracy, slower)
+    """
+
+    def __init__(self, model_size: str = 'tiny', device: str = 'cpu', compute_type: str = 'int8'):
+        self.model = None
+        self.model_size = model_size
+        try:
+            from faster_whisper import WhisperModel
+            self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            print(f"[WhisperSTT] Loaded {model_size} model ({device}/{compute_type})")
+        except Exception as e:
+            print(f"[WhisperSTT] Failed to load: {e}")
+
+    def transcribe(self, samples: np.ndarray, sample_rate: int = 16000) -> str:
+        """
+        Transcribe speech audio to text.
+
+        Args:
+            samples: Audio samples (float32, 16kHz) — should be speech segment
+            sample_rate: Sample rate (default 16kHz)
+
+        Returns:
+            Transcribed text string. Empty string if no speech detected.
+        """
+        if self.model is None:
+            return ""
+
+        try:
+            segments, info = self.model.transcribe(
+                samples,
+                beam_size=1,       # fastest
+                language=None,     # auto-detect
+                vad_filter=False,  # we already ran Silero VAD
+            )
+            text = ' '.join([seg.text for seg in segments]).strip()
+            return text
+        except Exception as e:
+            print(f"[WhisperSTT] Transcription error: {e}")
+            return ""
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Canary — behavioral analysis + anomaly detection
 # ---------------------------------------------------------------------------
 
 class Tier3Canary:
@@ -692,6 +995,11 @@ class AudioProcessor:
         self.tier2 = Tier2Enhanced(sample_rate) if (enable_tier2 and LIBROSA_AVAILABLE) else None
         self.tier3 = Tier3Canary(sample_rate) if enable_tier3 else None
 
+        # Edge filtering components (Lean Workflow Step 2)
+        self.silero_vad = SileroVAD(sample_rate) if SILERO_AVAILABLE else None
+        self.yamnet = YAMNetClassifier() if YAMNET_AVAILABLE else None
+        self.whisper_stt = WhisperSTT() if WHISPER_AVAILABLE else None
+
         # Feature history (vectors only — this IS the memory, not raw audio)
         self.feature_history: deque[AudioFeatureVector] = deque(maxlen=3600)  # ~5h at 5s
 
@@ -724,7 +1032,9 @@ class AudioProcessor:
                 consonance_score REAL,
                 rms_energy REAL,
                 vad_state INTEGER,
+                vad_confidence REAL,
                 audio_event TEXT,
+                transcribed_text TEXT,
                 anomaly_flag INTEGER,
                 baseline_deviation REAL,
                 feature_vector TEXT
@@ -758,8 +1068,14 @@ class AudioProcessor:
         self._process_thread.start()
 
         tier_status = ["Tier1:Core"]
+        if self.silero_vad and self.silero_vad.model:
+            tier_status.append("SileroVAD")
         if self.tier2:
             tier_status.append("Tier2:Enhanced")
+        if self.yamnet and self.yamnet.interpreter:
+            tier_status.append("YAMNet")
+        if self.whisper_stt and self.whisper_stt.model:
+            tier_status.append(f"Whisper:{self.whisper_stt.model_size}")
         if self.tier3:
             tier_status.append("Tier3:Canary")
         print(f"[AudioProcessor] Started — {' | '.join(tier_status)}")
@@ -841,11 +1157,21 @@ class AudioProcessor:
                 self._tier2_active = True
 
     def _extract_features(self, samples: np.ndarray) -> AudioFeatureVector:
-        """Run samples through active tiers, return feature vector."""
+        """
+        Run samples through active tiers + edge filters, return feature vector.
+
+        Lean Workflow:
+          1. Tier 1 Core (FFT features, always)
+          2. Silero VAD (overrides heuristic VAD if available)
+          3. Tier 2 Enhanced (librosa features, when CPU allows)
+          4. YAMNet classification (edge filter)
+          5. Whisper STT (speech → text, only when VAD=True)
+          6. Tier 3 Canary (behavioral analysis)
+        """
         now = time.time()
         fv = AudioFeatureVector(timestamp=now, tier=1)
 
-        # --- Tier 1: Always ---
+        # --- Tier 1: Always (FFT spectral features) ---
         t1 = self.tier1.extract(samples)
         fv.consonance_score = t1['consonance_score']
         fv.spectral_centroid = t1['spectral_centroid']
@@ -857,7 +1183,17 @@ class AudioProcessor:
         fv.vad_state = t1['vad_state']
         fv.peak_frequencies = t1['peak_frequencies']
 
-        # --- Tier 2: When active ---
+        # --- Edge Filter: Silero VAD (overrides heuristic if available) ---
+        if self.silero_vad and self.silero_vad.model is not None:
+            try:
+                is_speech, confidence = self.silero_vad.detect(samples)
+                fv.vad_state = is_speech
+                fv.vad_confidence = confidence
+            except Exception as e:
+                print(f"[AudioProcessor] Silero VAD error: {e}")
+                # Falls back to heuristic VAD from Tier 1
+
+        # --- Tier 2: Enhanced (when active, librosa features) ---
         t2 = None
         if self._tier2_active and self.tier2:
             try:
@@ -872,13 +1208,36 @@ class AudioProcessor:
             except Exception as e:
                 print(f"[AudioProcessor] Tier 2 error: {e}")
 
-        # --- Tier 3: When active (and anomaly check or scheduled) ---
+        # --- Edge Filter: YAMNet classification ---
+        if self.yamnet and self.yamnet.interpreter is not None:
+            try:
+                event, confidence, top3 = self.yamnet.classify(samples, self.sample_rate)
+                fv.audio_event = event
+                fv.event_confidence = confidence
+                fv.yamnet_top3 = top3
+
+                # Safety event escalation: force Tier 3 if canary-relevant
+                if self.yamnet.is_safety_event(event) and self.tier3:
+                    self._tier3_active = True
+            except Exception as e:
+                print(f"[AudioProcessor] YAMNet error: {e}")
+
+        # --- Edge Filter: Whisper STT (only when speech detected) ---
+        if self.whisper_stt and self.whisper_stt.model is not None and fv.vad_state:
+            try:
+                fv.transcribed_text = self.whisper_stt.transcribe(samples, self.sample_rate)
+            except Exception as e:
+                print(f"[AudioProcessor] Whisper STT error: {e}")
+
+        # --- Tier 3: Canary (behavioral analysis + anomaly detection) ---
         if self._tier3_active and self.tier3:
             try:
                 t3 = self.tier3.extract(samples, t1, t2)
                 fv.tier = 3
-                fv.audio_event = t3['audio_event']
-                fv.event_confidence = t3['event_confidence']
+                # Don't override YAMNet classification if it ran
+                if not fv.audio_event:
+                    fv.audio_event = t3['audio_event']
+                    fv.event_confidence = t3['event_confidence']
                 fv.prosody_valence = t3['prosody_valence']
                 fv.speech_rate = t3['speech_rate']
                 fv.repetition_score = t3['repetition_score']
@@ -892,18 +1251,20 @@ class AudioProcessor:
         return fv
 
     def _store_features(self, fv: AudioFeatureVector):
-        """Persist feature vector to SQLite. Vector only — never raw audio."""
+        """Persist feature vector to SQLite. Vector + text only — never raw audio."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute(
                 '''INSERT INTO audio_features
                    (timestamp, tier, consonance_score, rms_energy, vad_state,
-                    audio_event, anomaly_flag, baseline_deviation, feature_vector)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    vad_confidence, audio_event, transcribed_text,
+                    anomaly_flag, baseline_deviation, feature_vector)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
                     fv.timestamp, fv.tier, fv.consonance_score, fv.rms_energy,
-                    int(fv.vad_state), fv.audio_event, int(fv.anomaly_flag),
+                    int(fv.vad_state), fv.vad_confidence, fv.audio_event,
+                    fv.transcribed_text, int(fv.anomaly_flag),
                     fv.baseline_deviation, json.dumps(fv.to_dict()),
                 )
             )
@@ -966,10 +1327,12 @@ class AudioProcessor:
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    print("Audio Processor — Standalone Test")
-    print("=" * 50)
-    print(f"Tier 2 (librosa): {'Available' if LIBROSA_AVAILABLE else 'Not installed'}")
-    print(f"Tier 3 (TFLite):  {'Available' if TFLITE_AVAILABLE else 'Not installed'}")
+    print("Audio Processor — Standalone Test (Lean Workflow)")
+    print("=" * 60)
+    print(f"Silero VAD:        {'Available' if SILERO_AVAILABLE else 'Not installed (pip install torch)'}")
+    print(f"Tier 2 (librosa):  {'Available' if LIBROSA_AVAILABLE else 'Not installed (pip install librosa)'}")
+    print(f"YAMNet:            {'Available' if YAMNET_AVAILABLE else 'Not installed (need yamnet.tflite)'}")
+    print(f"Whisper STT:       {'Available' if WHISPER_AVAILABLE else 'Not installed (pip install faster-whisper)'}")
     print()
 
     processor = AudioProcessor(
@@ -985,13 +1348,20 @@ if __name__ == '__main__':
             time.sleep(5.5)
             features = processor.get_latest_features()
             if features:
+                vad_icon = f"[{features.vad_confidence:.0%}]" if features.vad_confidence > 0 else ""
                 print(f"[t={features.timestamp:.0f}] Tier {features.tier}")
                 print(f"  Consonance: {features.consonance_score:.3f} | "
                       f"Energy: {features.rms_energy:.4f} | "
-                      f"VAD: {'🗣️' if features.vad_state else '🔇'}")
+                      f"VAD: {'SPEECH' if features.vad_state else 'silent'} {vad_icon}")
                 print(f"  Centroid: {features.spectral_centroid:.0f} Hz | "
                       f"Flatness: {features.spectral_flatness:.3f} | "
                       f"Event: {features.audio_event}")
+
+                if features.transcribed_text:
+                    print(f"  STT: \"{features.transcribed_text}\"")
+
+                if features.yamnet_top3:
+                    print(f"  YAMNet: {' > '.join(features.yamnet_top3)}")
 
                 if features.tier >= 2:
                     print(f"  Pitch: {features.pitch_mean:.0f} Hz | "
@@ -999,9 +1369,9 @@ if __name__ == '__main__':
                           f"Onsets: {features.onset_rate:.1f}/s")
 
                 if features.tier >= 3:
-                    flag = "⚠️ ANOMALY" if features.anomaly_flag else "✓ Normal"
+                    flag = "!! ANOMALY" if features.anomaly_flag else "OK"
                     print(f"  Canary: {flag} | "
-                          f"Deviation: {features.baseline_deviation:.2f}σ | "
+                          f"Deviation: {features.baseline_deviation:.2f}s | "
                           f"Prosody: {features.prosody_valence:.2f} | "
                           f"Repetition: {features.repetition_score:.2f}")
 
