@@ -1,0 +1,9 @@
+LICENSE
+README.md
+setup.py
+villa_cog_assist.egg-info/PKG-INFO
+villa_cog_assist.egg-info/SOURCES.txt
+villa_cog_assist.egg-info/dependency_links.txt
+villa_cog_assist.egg-info/entry_points.txt
+villa_cog_assist.egg-info/requires.txt
+villa_cog_assist.egg-info/top_level.txt

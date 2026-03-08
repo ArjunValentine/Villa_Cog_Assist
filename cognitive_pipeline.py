@@ -6,6 +6,9 @@ from collections import deque
 from typing import List, Dict, Tuple, Optional
 import time
 from dataclasses import dataclass
+from ultralytics import YOLO
+import sqlite3
+import json
 
 
 @dataclass
@@ -25,11 +28,32 @@ class PostureData:
 
 
 @dataclass
+class DetectedObject:
+    """Data structure for detected objects."""
+    class_name: str
+    confidence: float
+    bbox_2d: Tuple[int, int, int, int]  # x1, y1, x2, y2
+    center_3d: np.ndarray  # 3D position in camera coordinates (x, y, z)
+    bbox_3d: np.ndarray  # 3D bounding box corners
+
+
+@dataclass
+class GazeObjectIntersection:
+    """Data structure for gaze-object intersections."""
+    object_class: str
+    intersection_point: np.ndarray  # 3D intersection point
+    distance_to_object: float
+    gaze_vector: np.ndarray
+
+
+@dataclass
 class FrameData:
     """Combined data for a single frame."""
     timestamp: float
     gaze: Optional[GazeData]
     posture: Optional[PostureData]
+    detected_objects: List[DetectedObject]
+    gaze_intersections: List[GazeObjectIntersection]
     color_image: np.ndarray
     depth_image: np.ndarray
 
@@ -42,7 +66,7 @@ class RealSenseCognitivePipeline:
     feature extraction (gaze vectors, posture Z-data), and temporal buffering.
     """
 
-    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30):
+    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30, yolo_model: str = 'yolov8n.pt'):
         """
         Initialize the RealSense pipeline with specified resolution and FPS.
 
@@ -50,6 +74,7 @@ class RealSenseCognitivePipeline:
             width: Frame width (default 1280)
             height: Frame height (default 720)
             fps: Frames per second (30 or 60, default 30)
+            yolo_model: YOLOv8 model to use (default 'yolov8n.pt' for nano model)
         """
         self.width = width
         self.height = height
@@ -73,6 +98,13 @@ class RealSenseCognitivePipeline:
             refine_face_landmarks=True
         )
 
+        # YOLO object detection
+        self.yolo = YOLO(yolo_model)
+
+        # SQLite database for logging observations
+        self.db_conn = sqlite3.connect('cognitive_observations.db')
+        self._init_database()
+
         # Temporal buffer: sliding window of 5 seconds
         self.buffer_duration = 5.0  # seconds
         self.frame_buffer: deque[FrameData] = deque()
@@ -82,6 +114,52 @@ class RealSenseCognitivePipeline:
         self.depth_intrinsics: Optional[rs.intrinsics] = None
 
         self.is_running = False
+
+    def _init_database(self):
+        """Initialize the SQLite database schema."""
+        cursor = self.db_conn.cursor()
+
+        # Create observations table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                event_type TEXT,
+                data TEXT
+            )
+        ''')
+
+        # Create gaze_events table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gaze_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                object_class TEXT,
+                confidence REAL,
+                distance REAL,
+                duration REAL
+            )
+        ''')
+
+        self.db_conn.commit()
+
+    def log_observation(self, event_type: str, data: Dict):
+        """Log an observation to the database."""
+        cursor = self.db_conn.cursor()
+        cursor.execute(
+            'INSERT INTO observations (timestamp, event_type, data) VALUES (?, ?, ?)',
+            (time.time(), event_type, json.dumps(data))
+        )
+        self.db_conn.commit()
+
+    def log_gaze_event(self, object_class: str, confidence: float, distance: float, duration: float = 0.0):
+        """Log a gaze event to the database."""
+        cursor = self.db_conn.cursor()
+        cursor.execute(
+            'INSERT INTO gaze_events (timestamp, object_class, confidence, distance, duration) VALUES (?, ?, ?, ?, ?)',
+            (time.time(), object_class, confidence, distance, duration)
+        )
+        self.db_conn.commit()
 
     def start(self) -> None:
         """Start the RealSense pipeline and initialize intrinsics."""
@@ -117,6 +195,133 @@ class RealSenseCognitivePipeline:
         """
         depth_value = depth_frame.get_distance(x, y)
         return depth_value
+
+    def _detect_objects(self, color_image: np.ndarray, depth_frame: rs.depth_frame) -> List[DetectedObject]:
+        """
+        Detect objects in the color image using YOLOv8 and calculate their 3D positions.
+
+        Args:
+            color_image: RGB color image
+            depth_frame: Aligned depth frame
+
+        Returns:
+            List of DetectedObject instances
+        """
+        detected_objects = []
+
+        # Run YOLO detection
+        results = self.yolo(color_image, conf=0.5)  # Confidence threshold
+
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                # Get bounding box coordinates
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                confidence = box.conf[0].cpu().numpy()
+                class_id = int(box.cls[0].cpu().numpy())
+                class_name = self.yolo.names[class_id]
+
+                # Calculate center point of bounding box
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+
+                # Get depth at center
+                depth = self._get_depth_at_pixel(depth_frame, center_x, center_y)
+
+                if depth > 0:  # Valid depth
+                    # Convert 2D pixel coordinates to 3D camera coordinates
+                    center_3d = self._pixel_to_3d(center_x, center_y, depth)
+
+                    # Create simple 3D bounding box (approximate)
+                    # Get depth at corners for more accurate bbox
+                    corners_2d = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+                    corners_3d = []
+                    for cx, cy in corners_2d:
+                        c_depth = self._get_depth_at_pixel(depth_frame, cx, cy)
+                        if c_depth > 0:
+                            corners_3d.append(self._pixel_to_3d(cx, cy, c_depth))
+                        else:
+                            corners_3d.append(center_3d)  # Fallback to center
+
+                    bbox_3d = np.array(corners_3d)
+
+                    detected_object = DetectedObject(
+                        class_name=class_name,
+                        confidence=float(confidence),
+                        bbox_2d=(x1, y1, x2, y2),
+                        center_3d=center_3d,
+                        bbox_3d=bbox_3d
+                    )
+                    detected_objects.append(detected_object)
+
+        return detected_objects
+
+    def _pixel_to_3d(self, x: int, y: int, depth: float) -> np.ndarray:
+        """
+        Convert 2D pixel coordinates and depth to 3D camera coordinates.
+
+        Args:
+            x: Pixel x coordinate
+            y: Pixel y coordinate
+            depth: Depth in meters
+
+        Returns:
+            3D point in camera coordinates (x, y, z)
+        """
+        if not self.color_intrinsics:
+            return np.array([0, 0, depth])
+
+        # Use RealSense intrinsics to deproject pixel to 3D
+        point_3d = rs.rs2_deproject_pixel_to_point(self.color_intrinsics, [x, y], depth)
+        return np.array(point_3d)
+
+    def _check_gaze_object_intersection(self, gaze_data: GazeData, detected_objects: List[DetectedObject]) -> List[GazeObjectIntersection]:
+        """
+        Check if gaze vectors intersect with detected object bounding boxes.
+
+        Args:
+            gaze_data: Current gaze data
+            detected_objects: List of detected objects
+
+        Returns:
+            List of intersections found
+        """
+        intersections = []
+
+        # Use average of left and right eye gaze for simplicity
+        gaze_vector = (gaze_data.left_eye_gaze + gaze_data.right_eye_gaze) / 2.0
+        gaze_vector = gaze_vector / np.linalg.norm(gaze_vector)  # Normalize
+
+        # Camera origin (assuming gaze is relative to camera)
+        camera_origin = np.array([0, 0, 0])
+
+        for obj in detected_objects:
+            # Simple intersection check: check if gaze ray passes near object center
+            # In a full implementation, you'd check intersection with the 3D bounding box
+
+            # Vector from camera to object center
+            to_object = obj.center_3d - camera_origin
+            distance_to_object = np.linalg.norm(to_object)
+
+            # Normalize direction to object
+            obj_direction = to_object / distance_to_object
+
+            # Angle between gaze and object direction
+            cos_angle = np.dot(gaze_vector, obj_direction)
+
+            # If angle is small (cos_angle close to 1), consider it an intersection
+            if cos_angle > 0.95:  # About 18 degrees tolerance
+                intersection_point = camera_origin + gaze_vector * distance_to_object
+
+                intersection = GazeObjectIntersection(
+                    object_class=obj.class_name,
+                    intersection_point=intersection_point,
+                    distance_to_object=distance_to_object,
+                    gaze_vector=gaze_vector
+                )
+                intersections.append(intersection)
+
+        return intersections
 
     def _extract_gaze_vectors(self, face_landmarks) -> Optional[GazeData]:
         """
@@ -224,11 +429,39 @@ class RealSenseCognitivePipeline:
             gaze_data = self._extract_gaze_vectors(results.face_landmarks) if results.face_landmarks else None
             posture_data = self._extract_posture_z(results.pose_landmarks, depth_frame) if results.pose_landmarks else None
 
+            # Detect objects
+            detected_objects = self._detect_objects(color_image, depth_frame)
+
+            # Check gaze-object intersections
+            gaze_intersections = []
+            if gaze_data and detected_objects:
+                gaze_intersections = self._check_gaze_object_intersection(gaze_data, detected_objects)
+
+                # Log gaze events to database
+                for intersection in gaze_intersections:
+                    self.log_gaze_event(
+                        intersection.object_class,
+                        0.0,  # We don't have object confidence here, could be improved
+                        intersection.distance_to_object
+                    )
+
+            # Log observations
+            if detected_objects:
+                for obj in detected_objects:
+                    self.log_observation('object_detected', {
+                        'class': obj.class_name,
+                        'confidence': obj.confidence,
+                        'position_3d': obj.center_3d.tolist(),
+                        'bbox_2d': list(obj.bbox_2d)
+                    })
+
             # Create frame data
             frame_data = FrameData(
                 timestamp=time.time(),
                 gaze=gaze_data,
                 posture=posture_data,
+                detected_objects=detected_objects,
+                gaze_intersections=gaze_intersections,
                 color_image=color_image,
                 depth_image=depth_image
             )
@@ -261,5 +494,7 @@ class RealSenseCognitivePipeline:
         return list(self.frame_buffer)
 
     def __del__(self):
-        """Cleanup: stop the pipeline if still running."""
+        """Cleanup: stop the pipeline if still running and close database."""
         self.stop()
+        if hasattr(self, 'db_conn'):
+            self.db_conn.close()

@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: villa_cog_assist
+Version: 0.1.0
+Summary: RealSense cognitive state monitoring pipeline
+License-File: LICENSE
+Requires-Dist: pyrealsense2
+Requires-Dist: numpy
+Requires-Dist: opencv-python
+Requires-Dist: mediapipe
+Requires-Dist: ultralytics
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary

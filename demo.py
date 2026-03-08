@@ -43,17 +43,33 @@ def main():
 
                     buffer_size = len(pipeline.get_buffered_data())
 
-                    print(".1f"
-                          f"Buffer: {buffer_size} frames")
+                    print(f"  FPS: {fps:.1f} | Buffer: {buffer_size} frames")
 
                     # Print feature availability
                     gaze_status = "✓" if frame_data.gaze else "✗"
                     posture_status = "✓" if frame_data.posture else "✗"
-                    print(f"  Gaze: {gaze_status} | Posture: {posture_status}")
+                    objects_count = len(frame_data.detected_objects)
+                    intersections_count = len(frame_data.gaze_intersections)
+
+                    print(f"  Gaze: {gaze_status} | Posture: {posture_status} | Objects: {objects_count} | Intersections: {intersections_count}")
 
                     if frame_data.posture:
-                        print(".2f"
-                              ".2f")
+                        print(f"  Posture: L-shoulder Z={frame_data.posture.left_shoulder_z:.2f}m | "
+                              f"R-shoulder Z={frame_data.posture.right_shoulder_z:.2f}m | "
+                              f"Torso Z={frame_data.posture.torso_center_z:.2f}m")
+
+                    # Print detected objects
+                    if frame_data.detected_objects:
+                        print("  Detected objects:")
+                        for obj in frame_data.detected_objects[:3]:  # Show first 3
+                            print(f"    {obj.class_name} ({obj.confidence:.2f}) @ "
+                                  f"[{obj.center_3d[0]:.2f}, {obj.center_3d[1]:.2f}, {obj.center_3d[2]:.2f}]m")
+
+                    # Print gaze intersections
+                    if frame_data.gaze_intersections:
+                        print("  Gaze intersections:")
+                        for intersection in frame_data.gaze_intersections[:2]:  # Show first 2
+                            print(f"    Looking at: {intersection.object_class} @ {intersection.distance_to_object:.2f}m")
 
             # Small delay to prevent overwhelming output
             time.sleep(0.1)
